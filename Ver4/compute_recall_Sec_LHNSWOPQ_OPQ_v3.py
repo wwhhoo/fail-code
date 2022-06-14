@@ -1,0 +1,229 @@
+import numpy as np
+import faiss
+import time
+from math import log10
+
+query     = np.loadtxt("./input/SIFT1M/SIFT1M_Query.txt")
+query     = np.float32(query)
+OPQquery  = np.load("./input/HNSWOPQ_with_OPQ_ver4/OPQ_Query.npy")
+OPQquery  = np.float32(OPQquery)
+HNSWquery = np.load("./input/HNSWOPQ_with_OPQ_ver4/HNSW_Query.npy")
+HNSWquery = np.float32(HNSWquery)
+label     = np.loadtxt("./input/SIFT1M/SIFT1M_Groundtruth_100NN.txt", dtype=int)
+Centroids = np.load("./input/kmeans_centroids.npy")
+Centroids = np.float32(Centroids)
+Sec_clu_num = np.load("./input/HNSWOPQ_with_OPQ_ver4/Second_cluster_data_num.npy")
+
+
+
+def flat(PQ_weight_path, PQ_data, PQ_ID, query, PQNN):
+    
+    index_OPQ16 = faiss.IndexFlatL2(PQ_data.shape[1])
+    PQ_data = np.float32(PQ_data)
+    index_OPQ16.add(PQ_data)
+    flat_start_time = time.time()
+    flat_D, flat_I = index_OPQ16.search(query, PQNN)
+    
+    flat_end_time = time.time()
+    flat_I = PQ_ID[flat_I]
+    time_cost = (flat_end_time-flat_start_time)
+
+    return flat_D, flat_I, time_cost
+
+def PQ_cand(PQ_weight_path, PQ_data, PQ_ID, query, PQNN):
+
+    
+    bits  = 8
+    nlist = 2**bits
+    PQ_data  = np.float32(PQ_data)
+    PQ_ID    = np.int64(PQ_ID)
+    PQ_ID    = np.reshape(PQ_ID, PQ_ID.shape[0])
+
+    index_ivfPQ = faiss.read_index(PQ_weight_path)
+    # must float 32, int 64
+    index_ivfPQ.add_with_ids(PQ_data,PQ_ID)
+    index_ivfPQ.nprobe = nlist
+    PQ_start_time = time.time()
+    PQ_D, PQ_I = index_ivfPQ.search(query, PQNN)
+    PQ_end_time = time.time()
+    time_cost = (PQ_end_time-PQ_start_time)
+
+    return PQ_D, PQ_I, time_cost
+
+def get_cand( faiss_I, query, HNSWquery, OPQquery, PQNN, k, Sec_clu_num):
+    centorid_path = "./input/HNSWOPQ_with_OPQ_ver4/centroids/kmeans_centroids_{}.npy"
+    OPQ_data_path = "./input/HNSWOPQ_with_OPQ_ver4/OPQ_data/Sec_OPQ_data_{}.npy"
+    OPQ_ID_path   = "./input/HNSWOPQ_with_OPQ_ver4/OPQ_ID/Sec_OPQ_{}_ID.npy"
+    OPQ32_weight_path = "./input/HNSWOPQ_with_OPQ_ver4/OPQ_index/index_OPQ.index"
+    OPQ16_weight_path = "./input/HNSWOPQ_with_OPQ_ver4/OPQ_index/HNSW_OPQindex.index"
+
+    candidate = 0
+    
+    total_D = np.asarray([])
+    total_I = np.asarray([],dtype=int)
+    
+    query = np.reshape(query,(1,128))
+    OPQquery = np.reshape(OPQquery,(1,128))
+    HNSWquery = np.reshape(HNSWquery,(1,128))
+    HNSW_time = 0.0
+    PQ_time = 0.0 
+    first = False
+    num = 0
+
+
+    H_index = 0
+    L_index = 0
+    H_OPQ_data = np.zeros((1000000,128))
+    H_OPQ_ID   = np.zeros((1000000))
+    L_OPQ_data = np.zeros((1000000,128))
+    L_OPQ_ID   = np.zeros((1000000))
+
+    for i in faiss_I:
+
+        Sec_Centroids = np.load(centorid_path.format(str(i)))
+        data = np.load(OPQ_data_path.format(str(i)))
+        data_ID = np.load(OPQ_ID_path.format(str(i)))
+        flat_index = faiss.IndexFlatL2(Sec_Centroids.shape[1])
+        flat_index.add(Sec_Centroids)
+        HNSW_start_time = time.time()
+        D, I = flat_index.search(query, k)
+        HNSW_end_time = time.time()
+        HNSW_time = HNSW_time + HNSW_end_time-HNSW_start_time
+
+        I = np.sort(I)
+        sec_clu = 0
+        sec_clu_index = 0
+
+        # print(I[0])
+        
+        for OPQdata in I[0]:
+            
+            sec_clu_data    = np.asarray([])
+            sec_clu_data_ID = np.asarray([])
+            for j in range (sec_clu_index,OPQdata):
+                sec_clu += Sec_clu_num[i,j]
+            sec_clu_index = OPQdata
+
+            candidate += Sec_clu_num[i,OPQdata]
+            sec_clu_data    = data[sec_clu:sec_clu+Sec_clu_num[i,OPQdata]]
+            sec_clu_data_ID = data_ID[sec_clu:sec_clu+Sec_clu_num[i,OPQdata]]
+
+            if OPQdata < 128:
+                H_OPQ_data[H_index:H_index+Sec_clu_num[i,OPQdata]] = sec_clu_data
+                H_OPQ_ID[H_index:H_index+Sec_clu_num[i,OPQdata]] = sec_clu_data_ID
+                H_index += Sec_clu_num[i,OPQdata]
+            else:
+                num += 1
+                L_OPQ_data[L_index:L_index+Sec_clu_num[i,OPQdata]] = sec_clu_data
+                L_OPQ_ID[L_index:L_index+Sec_clu_num[i,OPQdata]] = sec_clu_data_ID
+                L_index += Sec_clu_num[i,OPQdata]
+                first = True
+
+    PQ_D, PQ_I, PQ_time_cost = PQ_cand(OPQ32_weight_path, H_OPQ_data[:H_index], H_OPQ_ID[:H_index], OPQquery, PQNN)
+    
+    total_D = PQ_D
+    total_I = PQ_I
+    PQ_time = PQ_time_cost
+    if first:
+
+        PQ_D, PQ_I, PQ_time_cost = flat(OPQ16_weight_path, L_OPQ_data[:L_index], L_OPQ_ID[:L_index], HNSWquery, PQNN)
+        # PQ_D, PQ_I, PQ_time_cost = PQ_cand(OPQ16_weight_path, L_OPQ_data[:L_index], L_OPQ_ID[:L_index], HNSWquery, PQNN)
+        PQ_D = np.float64(PQ_D)
+        # PQ_D = PQ_D*1.035
+        total_D = np.concatenate((total_D,PQ_D),axis=None)
+        total_I = np.concatenate((total_I,PQ_I),axis=None)
+        # total_D = PQ_D
+        # total_I = PQ_I
+        # print(HNSWquery.shape)
+        PQ_time += PQ_time_cost
+    else:
+       
+        total_D = np.reshape(total_D,(total_D.shape[1]))
+        total_I = np.reshape(total_I,(total_I.shape[1]))
+    # total_D = np.reshape(total_D,(total_D.shape[1]))
+    # total_I = np.reshape(total_I,(total_I.shape[1]))
+    
+    return total_D, total_I, HNSW_time, PQ_time, candidate, num
+
+
+def sort_dis(total_D, total_I):
+
+    sort_index = np.argsort(total_D)
+    total_D = total_D[sort_index]
+    total_I = total_I[sort_index]
+
+    return total_D, total_I
+
+def recall(label, faiss_I, top, ad):
+    hit_rate = np.zeros(int(log10(ad)+1), dtype=float)
+    
+    for top_num in range(top):
+        
+        hit = np.where(faiss_I == label[top_num])
+        # print(faiss_I.shape)
+        if hit[0].size > 0:
+            if (hit[0] < 1 and top == 1):
+                hit_rate[0:int(log10(ad)+1)] += 1
+            elif (hit[0] < 10 and top <= 10 ):
+                hit_rate[1:int(log10(ad)+1)] += 1
+            elif (hit[0] < 100 ):
+                hit_rate[2:int(log10(ad)+1)] += 1
+            elif (hit[0] < 1000000 ):
+                hit_rate[3] += 1
+    return hit_rate
+
+if __name__ == '__main__':
+
+    d     = 128                           # dimension
+    bits  = 8
+    nlist = 2**bits
+    # m     = 16
+    k     = 0
+    top   = 1
+    PQNN  = 100
+    C     = 256
+    clu   = 5
+    ad    = 1000
+    
+
+
+    for times in range(4):
+        # clu +=5
+        OPQnum = 0
+        k+=5
+        print(k)
+        total_candidate = 0
+        start_time = time.time()
+        flat_index = faiss.IndexFlatL2(d)
+        flat_index.add(Centroids)
+        D, I = flat_index.search(query, clu)
+
+        total_HNSW_time_cost = 0.0
+        total_PQ_time_cost = 0.0
+        recall_score = np.zeros(4)
+
+        for i in range(query.shape[0]):
+            total_D, total_I, HNSW_cost, PQ_cost, candidate, num = get_cand(I[i], query[i], HNSWquery[i], OPQquery[i], PQNN, k, Sec_clu_num)
+            # print(total_D.shape)
+            total_D, total_I = sort_dis(total_D,total_I)
+            
+            recall_score += recall(label[i], total_I, top, ad)
+            total_HNSW_time_cost += HNSW_cost
+            total_PQ_time_cost += PQ_cost
+            total_candidate += candidate
+            OPQnum += num
+
+        end_time = time.time()
+        time_taken = end_time - start_time
+        hours, rest = divmod(time_taken,3600)
+        minutes, seconds = divmod(rest, 60)
+        print("This took %d hours %d minutes %f seconds" %(hours,minutes,seconds)) 
+        recall_score = (recall_score/(query.shape[0]*top))
+        print(recall_score)
+        np.savetxt("./output/HNSW_PQ_recall.txt", recall_score)
+        print("HNSW search time:", total_HNSW_time_cost)
+        print("PQ search time:", total_PQ_time_cost)
+        print("Search time:",total_HNSW_time_cost+total_PQ_time_cost)
+        print("Total candidate:", total_candidate/10000)
+        print("OPQ point:", OPQnum/10000/clu/k)
+
